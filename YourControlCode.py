@@ -10,7 +10,7 @@ class YourCtrl:
     self.init_qpos = d.qpos.copy()
     
     # Control gains 
-    self.kp = 150.0
+    self.kp = 10
     self.kd = 10.0
     
     # To track points 
@@ -18,11 +18,12 @@ class YourCtrl:
     self.current_idx = None # Index of current_target
     self.points_active = np.array([True] * 8) # Track active points (from PointManger)
     
-    self.thresh = 0.01 # Check if reached point
+    self.cur_point_steps = 0
+    self.thresh = 0.010 # Check if reached point
     
     self.ee_id = mujoco.mj_name2id(self.m, mujoco.mjtObj.mjOBJ_BODY, "EE_Frame")
 
-    self.damping = 0.03 # For Levenberg-Marquardt
+    self.damping = 0.01 # For Levenberg-Marquardt
 
   def jacobian(self):
     jacp = np.zeros((3, self.m.nv))
@@ -36,22 +37,39 @@ class YourCtrl:
     this function is called and the index of that point
     '''
     distances = np.linalg.norm(self.d.xpos[self.ee_id].copy() - self.target_points[:,].T, axis=1)
+
+    # considers magnitude of torque required to plan next point
+    torque_mags = np.zeros((8,))
+    for i in range(8):
+      torque_cmd =  self.get_torque_cmd(self.d.xpos[self.ee_id], self.target_points[:, i])
+      torque_mags[i] = np.linalg.norm(torque_cmd)
+    torque_mags = torque_mags  * 0.1
+    distances = torque_mags + distances
+    
     closest_index = np.argmin(np.where(self.points_active, distances, np.inf))
     closest = self.target_points[:, closest_index]
+
     return closest, closest_index
 
-  def CtrlUpdate(self):
-    current_pos = self.d.xpos[self.ee_id]
-    
-    if self.current_target is None: # Initializes first target point
-      self.current_target, self.current_idx = self.get_closest_point()
-    
-    # lavenberg-Marquardt algorithm
-    error = self.current_target - current_pos
-    
-    if np.linalg.norm(error) < self.thresh:
-      self.points_active[self.current_idx] = False
-      self.current_target, self.current_idx = self.get_closest_point()
+  def update_kp(self, target):
+    '''
+    Updates kp given the steps already taken and distance to the point
+    '''
+    distance = np.linalg.norm(self.d.xpos[self.ee_id] - target)
+    if self.cur_point_steps < 300 or distance > 0.05:
+      self.kp = 10
+    else:
+      if distance < 0.03 and self.cur_point_steps > 500:
+        self.kp = 500
+      else:
+        self.kp = 100
+
+  def get_torque_cmd(self, current_pos, target=None):
+    if target is None:
+      target = self.current_target
+    error = target - current_pos
+
+    self.update_kp(target)
 
     J = self.jacobian()
     
@@ -66,8 +84,27 @@ class YourCtrl:
     qdot = inv_J @ xdot
     
     jtorque_cmd = (qdot - self.d.qvel) * self.kp + self.d.qfrc_bias
-    
+
     return jtorque_cmd
 
+  def CtrlUpdate(self):
+    current_pos = self.d.xpos[self.ee_id]
+    
+    if self.current_target is None: # Initializes first target point
+      self.current_target, self.current_idx = self.get_closest_point()
+      
+    # lavenberg-Marquardt algorithm
+    error = self.current_target - current_pos
+
+    if np.linalg.norm(error) < self.thresh:
+      self.points_active[self.current_idx] = False
+      self.current_target, self.current_idx = self.get_closest_point()
+      print(f'Steps taken: {self.cur_point_steps}')
+      self.cur_point_steps = 0
+      self.kp = 10
+    else:
+      self.cur_point_steps += 1
+    
+    return self.get_torque_cmd(current_pos)
 
 
