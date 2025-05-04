@@ -1,110 +1,71 @@
 import mujoco
 import numpy as np
+from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+from scipy.interpolate import CubicSpline
 
 class YourCtrl:
-  def __init__(self, m:mujoco.MjModel, d: mujoco.MjData, target_points):
-    self.m = m
-    self.d = d
-    self.target_points = target_points
-    
-    self.init_qpos = d.qpos.copy()
-    
-    # Control gains 
-    self.kp = 10
-    self.kd = 10.0
-    
-    # To track points 
-    self.current_target = None # (3,)
-    self.current_idx = None # Index of current_target
-    self.points_active = np.array([True] * 8) # Track active points (from PointManger)
-    
-    self.cur_point_steps = 0
-    self.thresh = 0.010 # Check if reached point
-    
-    self.ee_id = mujoco.mj_name2id(self.m, mujoco.mjtObj.mjOBJ_BODY, "EE_Frame")
+    def __init__(self, m: mujoco.MjModel, d: mujoco.MjData, targets: np.ndarray,
+                 v_const=1.7, kp=190.0, kd=170.0, damping=0.01, min_dt=0.02):
+        self.m, self.d = m, d
 
-    self.damping = 0.01 # For Levenberg-Marquardt
+        # create self variables
+        self.v_const, self.kp, self.kd = v_const, kp, kd
+        self.damping, self.min_dt = damping, min_dt
 
-  def jacobian(self):
-    jacp = np.zeros((3, self.m.nv))
-    jacr = np.zeros((3, self.m.nv))
-    mujoco.mj_jac(self.m, self.d, jacp, jacr, self.d.xpos[self.ee_id], self.ee_id)
-    return jacp
+        #mujoco ee setup
+        self.ee_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "EE_Frame")
+        mujoco.mj_forward(m, d)
+        cur = d.xpos[self.ee_id]
 
-  def get_closest_point(self):
-    '''
-    Returns closest point to the EE (3,) right when 
-    this function is called and the index of that point
-    '''
-    distances = np.linalg.norm(self.d.xpos[self.ee_id].copy() - self.target_points[:,].T, axis=1)
+        # TSP ordering and rotate so first waypoint is closest
+        order = self._solve_tsp(targets)
+        wps   = [targets[:,i] for i in order]
+        k     = int(np.argmin([np.linalg.norm(cur-p) for p in wps]))
+        seq   = [cur] + wps[k:]+wps[:k]
 
-    # considers magnitude of torque required to plan next point
-    torque_mags = np.zeros((8,))
-    for i in range(8):
-      torque_cmd =  self.get_torque_cmd(self.d.xpos[self.ee_id], self.target_points[:, i])
-      torque_mags[i] = np.linalg.norm(torque_cmd)
-    torque_mags = torque_mags  * 0.1
-    distances = torque_mags + distances
-    
-    closest_index = np.argmin(np.where(self.points_active, distances, np.inf))
-    closest = self.target_points[:, closest_index]
+        #create and alloc time for splines
+        P     = np.stack(seq, axis=1)               
+        dists = np.linalg.norm(np.diff(P, axis=1), axis=0)
+        times = np.maximum(dists/self.v_const, self.min_dt)
+        times[0] *= 2.0                                    #double time for first point for stability
+        self.times   = np.concatenate(([0.], times.cumsum()))
+        self.splines = [CubicSpline(self.times, P[i], bc_type='clamped')
+                        for i in range(3)]
+        self.start_time = float(d.time)
 
-    return closest, closest_index
+    #greedy tsp solver
+    def _solve_tsp(self, pts):
+        
+        pts_list = pts.T.tolist()
+        N = len(pts_list)
 
-  def update_kp(self, target):
-    '''
-    Updates kp given the steps already taken and distance to the point
-    '''
-    distance = np.linalg.norm(self.d.xpos[self.ee_id] - target)
-    if self.cur_point_steps < 300 or distance > 0.05:
-      self.kp = 10
-    else:
-      if distance < 0.03 and self.cur_point_steps > 500:
-        self.kp = 500
-      else:
-        self.kp = 100
+        tour = [0]
+        remaining = set(range(1, N))
+        while remaining:
+            last = tour[-1]
+            # pick closest unvisited
+            nxt = min(remaining,
+                      key=lambda j: np.linalg.norm(np.array(pts_list[last]) - np.array(pts_list[j])))
+            tour.append(nxt)
+            remaining.remove(nxt)
 
-  def get_torque_cmd(self, current_pos, target=None):
-    if target is None:
-      target = self.current_target
-    error = target - current_pos
+        return tour
 
-    self.update_kp(target)
+    def CtrlUpdate(self):
+        t = np.clip(self.d.time - self.start_time, 0, self.times[-1])
 
-    J = self.jacobian()
-    
-    product = J @ J.T + self.damping * np.eye(3)
+        #uses splines for pos/velocity
+        x_des = np.array([s(t) for s in self.splines])
+        v_des = np.array([s.derivative()(t) for s in self.splines])
 
-    if np.isclose(np.linalg.det(product), 0):
-      inv_J = J.T @ np.linalg.pinv(product)
-    else: 
-      inv_J = J.T @ np.linalg.inv(product)
+        e     = x_des - self.d.xpos[self.ee_id]
+        xdot  = v_des + self.kp * e
 
-    xdot = self.kp * error
-    qdot = inv_J @ xdot
-    
-    jtorque_cmd = (qdot - self.d.qvel) * self.kp + self.d.qfrc_bias
+        Jp    = np.zeros((3, self.m.nv))
+        mujoco.mj_jac(self.m, self.d, Jp, np.zeros_like(Jp),
+                      self.d.xpos[self.ee_id], self.ee_id)
+        
+        J_pinv = Jp.T @ np.linalg.pinv(Jp @ Jp.T + self.damping*np.eye(3))
 
-    return jtorque_cmd
-
-  def CtrlUpdate(self):
-    current_pos = self.d.xpos[self.ee_id]
-    
-    if self.current_target is None: # Initializes first target point
-      self.current_target, self.current_idx = self.get_closest_point()
-      
-    # lavenberg-Marquardt algorithm
-    error = self.current_target - current_pos
-
-    if np.linalg.norm(error) < self.thresh:
-      self.points_active[self.current_idx] = False
-      self.current_target, self.current_idx = self.get_closest_point()
-      print(f'Steps taken: {self.cur_point_steps}')
-      self.cur_point_steps = 0
-      self.kp = 10
-    else:
-      self.cur_point_steps += 1
-    
-    return self.get_torque_cmd(current_pos)
-
-
+        qdot_des = J_pinv @ xdot
+        return self.kd*(qdot_des - self.d.qvel) + self.d.qfrc_bias
