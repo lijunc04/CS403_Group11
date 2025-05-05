@@ -10,8 +10,11 @@ class YourCtrl:
     self.init_qpos = d.qpos.copy()
     
     # Control gains 
-    self.kp = 10
-    self.kd = 10.0
+    self.kp_default = 100
+    self.kp = self.kp_default
+    
+    self.kd_default = 50
+    self.kd = self.kd_default
     
     # To track points 
     self.current_target = None # (3,)
@@ -23,7 +26,7 @@ class YourCtrl:
     
     self.ee_id = mujoco.mj_name2id(self.m, mujoco.mjtObj.mjOBJ_BODY, "EE_Frame")
 
-    self.damping = 0.01 # For Levenberg-Marquardt
+    self.damping = 0.001 # For Levenberg-Marquardt
 
   def jacobian(self):
     jacp = np.zeros((3, self.m.nv))
@@ -57,10 +60,19 @@ class YourCtrl:
     '''
     distance = np.linalg.norm(self.d.xpos[self.ee_id] - target)
     if self.cur_point_steps < 300 or distance > 0.05:
-      self.kp = 10
+      if distance > 1:
+        self.kp = 500
+        self.kd = self.kd_default * 0.8
+      else:
+        if np.sum(self.points_active) == 8:
+          self.kp = 10
+        else:
+          self.kp = self.kp_default
+          self.kd = self.kd_default
     else:
       if distance < 0.03 and self.cur_point_steps > 500:
         self.kp = 500
+        self.kd = self.kd_default * 1.5 
       else:
         self.kp = 100
 
@@ -83,7 +95,7 @@ class YourCtrl:
     xdot = self.kp * error
     qdot = inv_J @ xdot
     
-    jtorque_cmd = (qdot - self.d.qvel) * self.kp + self.d.qfrc_bias
+    jtorque_cmd = (qdot - self.d.qvel) * self.kd + self.d.qfrc_bias
 
     return jtorque_cmd
 
@@ -101,7 +113,7 @@ class YourCtrl:
       self.current_target, self.current_idx = self.get_closest_point()
       print(f'Steps taken: {self.cur_point_steps}')
       self.cur_point_steps = 0
-      self.kp = 10
+      self.kp = self.kp_default
     else:
       self.cur_point_steps += 1
     
